@@ -18,12 +18,14 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.collect.CollectPreconditions.checkRemove;
 
 import com.google.common.annotations.GwtIncompatible;
+import com.google.common.annotations.J2ktIncompatible;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Equivalence;
 import com.google.common.collect.MapMaker.Dummy;
 import com.google.common.primitives.Ints;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
+import com.google.errorprone.annotations.concurrent.LazyInit;
 import com.google.j2objc.annotations.Weak;
 import com.google.j2objc.annotations.WeakOuter;
 import java.io.IOException;
@@ -65,6 +67,7 @@ import javax.annotation.CheckForNull;
  * @author Doug Lea ({@code ConcurrentHashMap})
  */
 // TODO(kak): Consider removing @CanIgnoreReturnValue from this class.
+@J2ktIncompatible
 @GwtIncompatible
 @SuppressWarnings({
   "GuardedBy", // TODO(b/35466881): Fix or suppress.
@@ -131,8 +134,6 @@ class MapMakerInternalMap<
   // TODO(fry): empirically optimize this
   static final int DRAIN_MAX = 16;
 
-  static final long CLEANUP_EXECUTOR_DELAY_SECS = 60;
-
   // Fields
 
   /**
@@ -194,7 +195,7 @@ class MapMakerInternalMap<
     }
 
     for (int i = 0; i < this.segments.length; ++i) {
-      this.segments[i] = createSegment(segmentSize, MapMaker.UNSET_INT);
+      this.segments[i] = createSegment(segmentSize);
     }
   }
 
@@ -291,7 +292,7 @@ class MapMakerInternalMap<
     Strength valueStrength();
 
     /** Returns a freshly created segment, typed at the {@code S} type. */
-    S newSegment(MapMakerInternalMap<K, V, E, S> map, int initialCapacity, int maxSegmentSize);
+    S newSegment(MapMakerInternalMap<K, V, E, S> map, int initialCapacity);
 
     /**
      * Returns a freshly created entry, typed at the {@code E} type, for the given {@code segment}.
@@ -440,9 +441,8 @@ class MapMakerInternalMap<
           MapMakerInternalMap<
                   K, V, StrongKeyStrongValueEntry<K, V>, StrongKeyStrongValueSegment<K, V>>
               map,
-          int initialCapacity,
-          int maxSegmentSize) {
-        return new StrongKeyStrongValueSegment<>(map, initialCapacity, maxSegmentSize);
+          int initialCapacity) {
+        return new StrongKeyStrongValueSegment<>(map, initialCapacity);
       }
 
       @Override
@@ -489,6 +489,7 @@ class MapMakerInternalMap<
     }
 
     @Override
+    @CheckForNull
     public final V getValue() {
       return valueReference.get();
     }
@@ -538,9 +539,8 @@ class MapMakerInternalMap<
       public StrongKeyWeakValueSegment<K, V> newSegment(
           MapMakerInternalMap<K, V, StrongKeyWeakValueEntry<K, V>, StrongKeyWeakValueSegment<K, V>>
               map,
-          int initialCapacity,
-          int maxSegmentSize) {
-        return new StrongKeyWeakValueSegment<>(map, initialCapacity, maxSegmentSize);
+          int initialCapacity) {
+        return new StrongKeyWeakValueSegment<>(map, initialCapacity);
       }
 
       @Override
@@ -635,9 +635,8 @@ class MapMakerInternalMap<
       public StrongKeyDummyValueSegment<K> newSegment(
           MapMakerInternalMap<K, Dummy, StrongKeyDummyValueEntry<K>, StrongKeyDummyValueSegment<K>>
               map,
-          int initialCapacity,
-          int maxSegmentSize) {
-        return new StrongKeyDummyValueSegment<K>(map, initialCapacity, maxSegmentSize);
+          int initialCapacity) {
+        return new StrongKeyDummyValueSegment<K>(map, initialCapacity);
       }
 
       @Override
@@ -748,9 +747,8 @@ class MapMakerInternalMap<
       @Override
       public WeakKeyDummyValueSegment<K> newSegment(
           MapMakerInternalMap<K, Dummy, WeakKeyDummyValueEntry<K>, WeakKeyDummyValueSegment<K>> map,
-          int initialCapacity,
-          int maxSegmentSize) {
-        return new WeakKeyDummyValueSegment<>(map, initialCapacity, maxSegmentSize);
+          int initialCapacity) {
+        return new WeakKeyDummyValueSegment<>(map, initialCapacity);
       }
 
       @Override
@@ -841,9 +839,8 @@ class MapMakerInternalMap<
       public WeakKeyStrongValueSegment<K, V> newSegment(
           MapMakerInternalMap<K, V, WeakKeyStrongValueEntry<K, V>, WeakKeyStrongValueSegment<K, V>>
               map,
-          int initialCapacity,
-          int maxSegmentSize) {
-        return new WeakKeyStrongValueSegment<>(map, initialCapacity, maxSegmentSize);
+          int initialCapacity) {
+        return new WeakKeyStrongValueSegment<>(map, initialCapacity);
       }
 
       @Override
@@ -942,9 +939,8 @@ class MapMakerInternalMap<
       @Override
       public WeakKeyWeakValueSegment<K, V> newSegment(
           MapMakerInternalMap<K, V, WeakKeyWeakValueEntry<K, V>, WeakKeyWeakValueSegment<K, V>> map,
-          int initialCapacity,
-          int maxSegmentSize) {
-        return new WeakKeyWeakValueSegment<>(map, initialCapacity, maxSegmentSize);
+          int initialCapacity) {
+        return new WeakKeyWeakValueSegment<>(map, initialCapacity);
       }
 
       @Override
@@ -1155,14 +1151,15 @@ class MapMakerInternalMap<
     return segments[(hash >>> segmentShift) & segmentMask];
   }
 
-  Segment<K, V, E, S> createSegment(int initialCapacity, int maxSegmentSize) {
-    return entryHelper.newSegment(this, initialCapacity, maxSegmentSize);
+  Segment<K, V, E, S> createSegment(int initialCapacity) {
+    return entryHelper.newSegment(this, initialCapacity);
   }
 
   /**
    * Gets the value from an entry. Returns {@code null} if the entry is invalid, partially-collected
    * or computing.
    */
+  @CheckForNull
   V getLiveValue(E entry) {
     if (entry.getKey() == null) {
       return null;
@@ -1239,18 +1236,14 @@ class MapMakerInternalMap<
     /** The per-segment table. */
     @CheckForNull volatile AtomicReferenceArray<E> table;
 
-    /** The maximum size of this map. MapMaker.UNSET_INT if there is no maximum. */
-    final int maxSegmentSize;
-
     /**
      * A counter of the number of reads since the last write, used to drain queues on a small
      * fraction of read operations.
      */
     final AtomicInteger readCount = new AtomicInteger();
 
-    Segment(MapMakerInternalMap<K, V, E, S> map, int initialCapacity, int maxSegmentSize) {
+    Segment(MapMakerInternalMap<K, V, E, S> map, int initialCapacity) {
       this.map = map;
-      this.maxSegmentSize = maxSegmentSize;
       initTable(newEntryArray(initialCapacity));
     }
 
@@ -1275,6 +1268,7 @@ class MapMakerInternalMap<
     }
 
     /** Returns a copy of the given {@code entry}. */
+    @CheckForNull
     E copyEntry(E original, E newNext) {
       return this.map.entryHelper.copy(self(), original, newNext);
     }
@@ -1285,10 +1279,6 @@ class MapMakerInternalMap<
 
     void initTable(AtomicReferenceArray<E> newTable) {
       this.threshold = newTable.length() * 3 / 4; // 0.75
-      if (this.threshold == maxSegmentSize) {
-        // prevent spurious expansion before eviction
-        this.threshold++;
-      }
       this.table = newTable;
     }
 
@@ -1366,6 +1356,7 @@ class MapMakerInternalMap<
     }
 
     /** Unsafely removes the given entry from the given chain in this segment's hash table. */
+    @CheckForNull
     E removeFromChainForTesting(InternalEntry<K, V, ?> first, InternalEntry<K, V, ?> entry) {
       return removeFromChain(castForTesting(first), castForTesting(entry));
     }
@@ -1424,6 +1415,7 @@ class MapMakerInternalMap<
     }
 
     /** Returns first entry of bin for given hash. */
+    @CheckForNull
     E getFirst(int hash) {
       // read this volatile field only once
       AtomicReferenceArray<E> table = this.table;
@@ -1432,6 +1424,7 @@ class MapMakerInternalMap<
 
     // Specialized implementations of map methods
 
+    @CheckForNull
     E getEntry(Object key, int hash) {
       if (count != 0) { // read-volatile
         for (E e = getFirst(hash); e != null; e = e.getNext()) {
@@ -1454,10 +1447,12 @@ class MapMakerInternalMap<
       return null;
     }
 
+    @CheckForNull
     E getLiveEntry(Object key, int hash) {
       return getEntry(key, hash);
     }
 
+    @CheckForNull
     V get(Object key, int hash) {
       try {
         E e = getLiveEntry(key, hash);
@@ -1517,6 +1512,7 @@ class MapMakerInternalMap<
       }
     }
 
+    @CheckForNull
     V put(K key, int hash, V value, boolean onlyIfAbsent) {
       lock();
       try {
@@ -1690,6 +1686,7 @@ class MapMakerInternalMap<
       }
     }
 
+    @CheckForNull
     V replace(K key, int hash, V newValue) {
       lock();
       try {
@@ -1731,6 +1728,7 @@ class MapMakerInternalMap<
       }
     }
 
+    @CheckForNull
     @CanIgnoreReturnValue
     V remove(Object key, int hash) {
       lock();
@@ -1845,6 +1843,7 @@ class MapMakerInternalMap<
      * @return the new first entry for the table
      */
     @GuardedBy("this")
+    @CheckForNull
     E removeFromChain(E first, E entry) {
       int newCount = count;
       E newFirst = entry.getNext();
@@ -2046,9 +2045,8 @@ class MapMakerInternalMap<
         MapMakerInternalMap<
                 K, V, StrongKeyStrongValueEntry<K, V>, StrongKeyStrongValueSegment<K, V>>
             map,
-        int initialCapacity,
-        int maxSegmentSize) {
-      super(map, initialCapacity, maxSegmentSize);
+        int initialCapacity) {
+      super(map, initialCapacity);
     }
 
     @Override
@@ -2058,7 +2056,9 @@ class MapMakerInternalMap<
 
     @SuppressWarnings("unchecked")
     @Override
-    public StrongKeyStrongValueEntry<K, V> castForTesting(InternalEntry<K, V, ?> entry) {
+    @CheckForNull
+    public StrongKeyStrongValueEntry<K, V> castForTesting(
+        @CheckForNull InternalEntry<K, V, ?> entry) {
       return (StrongKeyStrongValueEntry<K, V>) entry;
     }
   }
@@ -2071,9 +2071,8 @@ class MapMakerInternalMap<
     StrongKeyWeakValueSegment(
         MapMakerInternalMap<K, V, StrongKeyWeakValueEntry<K, V>, StrongKeyWeakValueSegment<K, V>>
             map,
-        int initialCapacity,
-        int maxSegmentSize) {
-      super(map, initialCapacity, maxSegmentSize);
+        int initialCapacity) {
+      super(map, initialCapacity);
     }
 
     @Override
@@ -2088,7 +2087,9 @@ class MapMakerInternalMap<
 
     @SuppressWarnings("unchecked")
     @Override
-    public StrongKeyWeakValueEntry<K, V> castForTesting(InternalEntry<K, V, ?> entry) {
+    @CheckForNull
+    public StrongKeyWeakValueEntry<K, V> castForTesting(
+        @CheckForNull InternalEntry<K, V, ?> entry) {
       return (StrongKeyWeakValueEntry<K, V>) entry;
     }
 
@@ -2134,9 +2135,8 @@ class MapMakerInternalMap<
     StrongKeyDummyValueSegment(
         MapMakerInternalMap<K, Dummy, StrongKeyDummyValueEntry<K>, StrongKeyDummyValueSegment<K>>
             map,
-        int initialCapacity,
-        int maxSegmentSize) {
-      super(map, initialCapacity, maxSegmentSize);
+        int initialCapacity) {
+      super(map, initialCapacity);
     }
 
     @Override
@@ -2159,9 +2159,8 @@ class MapMakerInternalMap<
     WeakKeyStrongValueSegment(
         MapMakerInternalMap<K, V, WeakKeyStrongValueEntry<K, V>, WeakKeyStrongValueSegment<K, V>>
             map,
-        int initialCapacity,
-        int maxSegmentSize) {
-      super(map, initialCapacity, maxSegmentSize);
+        int initialCapacity) {
+      super(map, initialCapacity);
     }
 
     @Override
@@ -2199,9 +2198,8 @@ class MapMakerInternalMap<
 
     WeakKeyWeakValueSegment(
         MapMakerInternalMap<K, V, WeakKeyWeakValueEntry<K, V>, WeakKeyWeakValueSegment<K, V>> map,
-        int initialCapacity,
-        int maxSegmentSize) {
-      super(map, initialCapacity, maxSegmentSize);
+        int initialCapacity) {
+      super(map, initialCapacity);
     }
 
     @Override
@@ -2221,7 +2219,8 @@ class MapMakerInternalMap<
 
     @SuppressWarnings("unchecked")
     @Override
-    public WeakKeyWeakValueEntry<K, V> castForTesting(InternalEntry<K, V, ?> entry) {
+    @CheckForNull
+    public WeakKeyWeakValueEntry<K, V> castForTesting(@CheckForNull InternalEntry<K, V, ?> entry) {
       return (WeakKeyWeakValueEntry<K, V>) entry;
     }
 
@@ -2269,9 +2268,8 @@ class MapMakerInternalMap<
 
     WeakKeyDummyValueSegment(
         MapMakerInternalMap<K, Dummy, WeakKeyDummyValueEntry<K>, WeakKeyDummyValueSegment<K>> map,
-        int initialCapacity,
-        int maxSegmentSize) {
-      super(map, initialCapacity, maxSegmentSize);
+        int initialCapacity) {
+      super(map, initialCapacity);
     }
 
     @Override
@@ -2392,6 +2390,7 @@ class MapMakerInternalMap<
    * Returns the internal entry for the specified key. The entry may be computing or partially
    * collected. Does not impact recency ordering.
    */
+  @CheckForNull
   E getEntry(@CheckForNull Object key) {
     if (key == null) {
       return null;
@@ -2524,7 +2523,7 @@ class MapMakerInternalMap<
     }
   }
 
-  @CheckForNull transient Set<K> keySet;
+  @LazyInit @CheckForNull transient Set<K> keySet;
 
   @Override
   public Set<K> keySet() {
@@ -2532,7 +2531,7 @@ class MapMakerInternalMap<
     return (ks != null) ? ks : (keySet = new KeySet());
   }
 
-  @CheckForNull transient Collection<V> values;
+  @LazyInit @CheckForNull transient Collection<V> values;
 
   @Override
   public Collection<V> values() {
@@ -2540,7 +2539,7 @@ class MapMakerInternalMap<
     return (vs != null) ? vs : (values = new Values());
   }
 
-  @CheckForNull transient Set<Entry<K, V>> entrySet;
+  @LazyInit @CheckForNull transient Set<Entry<K, V>> entrySet;
 
   @Override
   public Set<Entry<K, V>> entrySet() {
@@ -2890,6 +2889,7 @@ class MapMakerInternalMap<
         this);
   }
 
+  @J2ktIncompatible // java.io.ObjectInputStream
   private void readObject(ObjectInputStream in) throws InvalidObjectException {
     throw new InvalidObjectException("Use SerializationProxy");
   }
@@ -2940,6 +2940,7 @@ class MapMakerInternalMap<
     }
 
     @SuppressWarnings("deprecation") // serialization of deprecated feature
+    @J2ktIncompatible // java.io.ObjectInputStream
     MapMaker readMapMaker(ObjectInputStream in) throws IOException {
       int size = in.readInt();
       return new MapMaker()
@@ -2951,6 +2952,7 @@ class MapMakerInternalMap<
     }
 
     @SuppressWarnings("unchecked")
+    @J2ktIncompatible // java.io.ObjectInputStream
     void readEntries(ObjectInputStream in) throws IOException, ClassNotFoundException {
       while (true) {
         K key = (K) in.readObject();
@@ -2986,6 +2988,7 @@ class MapMakerInternalMap<
       writeMapTo(out);
     }
 
+    @J2ktIncompatible // java.io.ObjectInputStream
     private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
       in.defaultReadObject();
       MapMaker mapMaker = readMapMaker(in);
